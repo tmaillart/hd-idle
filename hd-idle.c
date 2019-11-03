@@ -121,6 +121,26 @@
 #include <scsi/sg.h>
 #include <scsi/scsi.h>
 
+/*#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <scsi/scsi.h>
+#include <scsi/sg.h>
+
+#include "sgio.h"
+#include "hdparm.h"
+
+#include <linux/hdreg.h> */
+
+#define ATA_OP_CHECKPOWERMODE2 0x98
+#define ATA_OP_CHECKPOWERMODE1 0xe5
 #define STAT_FILE "/proc/diskstats"
 #define DEFAULT_IDLE_TIME 600
 
@@ -159,6 +179,62 @@ IDLE_TIME *it_root;
 DISKSTATS *ds_root;
 char *logfile = "/dev/null";
 int debug;
+
+int do_drive_cmd (int fd, unsigned char *args, unsigned int timeout_secs)
+{
+#ifdef SG_IO
+
+	struct ata_tf tf;
+	void *data = NULL;
+	unsigned int data_bytes = 0;
+	int rc;
+
+	if (args == NULL)
+		goto use_legacy_ioctl;
+	/*
+	 * Reformat and try to issue via SG_IO:
+	 * args[0]: command in; status out.
+	 * args[1]: lbal for SMART, nsect for all others; error out
+	 * args[2]: feat in; nsect out.
+	 * args[3]: data-count (512 multiple) for all cmds.
+	 */
+	tf_init(&tf, args[0], 0, 0);
+	tf.lob.nsect = args[1];
+	tf.lob.feat  = args[2];
+	if (args[3]) {
+		data_bytes   = args[3] * 512;
+		data         = args + 4;
+		if (!tf.lob.nsect)
+			tf.lob.nsect = args[3];
+	}
+	if (tf.command == ATA_OP_SMART) {
+		tf.lob.nsect = args[3];
+		tf.lob.lbal  = args[1];
+		tf.lob.lbam  = 0x4f;
+		tf.lob.lbah  = 0xc2;
+	}
+
+	rc = sg16(fd, SG_READ, is_dma(tf.command), &tf, data, data_bytes, timeout_secs);
+	if (rc == -1) {
+		if (errno == EINVAL || errno == ENODEV || errno == EBADE)
+			goto use_legacy_ioctl;
+	}
+
+	if (rc == 0 || errno == EIO) {
+		args[0] = tf.status;
+		args[1] = tf.error;
+		args[2] = tf.lob.nsect;
+	}
+	return rc;
+
+use_legacy_ioctl:
+#endif /* SG_IO */
+	if (verbose) {
+		if (args)
+			fprintf(stderr, "Trying legacy HDIO_DRIVE_CMD\n");
+	}
+	return ioctl(fd, HDIO_DRIVE_CMD, args);
+}
 
 /* main function */
 int main(int argc, char *argv[])
@@ -302,6 +378,24 @@ int main(int argc, char *argv[])
 
         } else if (ds->reads == tmp.reads && ds->writes == tmp.writes) {
           if (!ds->spun_down) {
+            //CHECK POWER STATUS
+                    __u8 args[4] = {ATA_OP_CHECKPOWERMODE1,0,0,0};
+                    const char *state = "unknown";
+                    if (do_drive_cmd(fd, args, 0)
+                     && (args[0] = ATA_OP_CHECKPOWERMODE2) /* (single =) try again with 0x98 */
+                     && do_drive_cmd(fd, args, 0)) {
+                            err = errno;
+                    } else {
+                            switch (args[2]) {
+                                    case 0x00: state = "standby";		break;
+                                    case 0x40: state = "NVcache_spindown";	break;
+                                    case 0x41: state = "NVcache_spinup";	break;
+                                    case 0x80: state = "idle";		break;
+                                    case 0xff: state = "active/idle";	break;
+                            }
+                    }
+                    printf(" drive state is:  %s\n", state);
+
             /* no activity on this disk and still running */
             if (ds->idle_time != 0 && now - ds->last_io >= ds->idle_time) {
               spindown_disk(ds->name);
